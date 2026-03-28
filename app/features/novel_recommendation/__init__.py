@@ -1,0 +1,2 @@
+"""Novel recommendation feature scaffold."""
+

@@ -1,0 +1,2 @@
+"""Novel recommendation API routes."""
+

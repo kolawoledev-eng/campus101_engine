@@ -1,0 +1,2 @@
+"""Study notes API routes."""
+
