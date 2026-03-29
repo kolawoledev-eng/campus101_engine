@@ -14,8 +14,10 @@ from app.db import get_supabase_client
 INPUT_TOKEN_PRICE_PER_1K = Decimal("0.003")
 OUTPUT_TOKEN_PRICE_PER_1K = Decimal("0.015")
 
-# Many Claude models cap completion at 8192; 6000 was too low for 20+ long cards → truncated JSON, no DB save.
+# Claude caps completion around 8192 tokens; 20+ long cards in one JSON still truncates.
+# We request subtopics in chunks so each response completes, then merge before DB insert.
 STUDY_NOTES_MAX_OUTPUT_TOKENS = 8192
+STUDY_NOTES_CHUNK_SIZE = 6
 
 
 @dataclass
@@ -80,9 +82,18 @@ class StudyNotesService:
         year: int,
         subject: str,
         topic: str,
-        min_subtopics: int,
+        batch_count: int,
         read_time_target_minutes: int,
+        covered_subtopics: List[str],
     ) -> str:
+        covered_block = ""
+        if covered_subtopics:
+            # Keep prompt small; model only needs to avoid dupes.
+            tail = covered_subtopics[-60:]
+            covered_block = (
+                "\n\nSubtopics already covered in earlier batches — do NOT repeat or closely paraphrase:\n- "
+                + "\n- ".join(tail)
+            )
         return f"""
 You are an expert exam prep curriculum writer.
 
@@ -91,6 +102,10 @@ Create study notes for:
 - Year: {year}
 - Subject: {subject}
 - Main topic: {topic}
+
+This batch only: produce **exactly {batch_count}** distinct subtopics under the main topic above.
+Target read depth: about {read_time_target_minutes} minutes per card (compact prose).
+{covered_block}
 
 Output must be JSON only and follow this exact schema:
 {{
@@ -110,8 +125,8 @@ Output must be JSON only and follow this exact schema:
 }}
 
 Hard rules:
-1) Return at least {min_subtopics} UNIQUE subtopics.
-2) Each summary_text: **130-260 words** (strict). Longer prose will be cut off and break JSON — stay compact.
+1) The "notes" array must contain **at least {batch_count}** objects (distinct subtopics).
+2) Each summary_text: **120-200 words** (strict). Stay compact so the JSON completes in one response.
 3) Valid JSON only: escape double quotes inside strings as \\", use \\n for newlines inside strings, no raw line breaks inside quoted strings.
 4) Use official curriculum-style wording relevant to {exam.upper()}.
 5) Keep notes practical and exam-focused.
@@ -127,7 +142,7 @@ Hard rules:
             return m.group(1).strip()
         return raw
 
-    def _parse_and_validate(self, raw_text: str, min_subtopics: int) -> List[Dict[str, Any]]:
+    def _parse_and_validate(self, raw_text: str, min_required: int) -> List[Dict[str, Any]]:
         text = self._extract_json_text(raw_text)
         try:
             payload = json.loads(text)
@@ -183,9 +198,9 @@ Hard rules:
                 }
             )
 
-        if len(validated) < min_subtopics:
+        if len(validated) < min_required:
             raise ValueError(
-                f"Generated {len(validated)} valid subtopics, below required minimum {min_subtopics}"
+                f"Generated {len(validated)} valid subtopics, below required minimum {min_required}"
             )
         return validated
 
@@ -202,28 +217,70 @@ Hard rules:
     ) -> StudyNotesResult:
         self._validate_tree(exam, year, subject, topic)
 
-        prompt = self._build_prompt(
-            exam=exam,
-            year=year,
-            subject=subject,
-            topic=topic,
-            min_subtopics=min_subtopics,
-            read_time_target_minutes=read_time_target_minutes,
-        )
-        resp = self.client.messages.create(
-            model=self.model,
-            max_tokens=STUDY_NOTES_MAX_OUTPUT_TOKENS,
-            temperature=0.4,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        raw = resp.content[0].text
-        if getattr(resp, "stop_reason", None) == "max_tokens":
-            raise ValueError(
-                "Claude hit the maximum output length; the JSON was likely incomplete. "
-                "Retry once, or lower min_subtopics / ask for shorter cards per topic."
+        accumulated: List[Dict[str, Any]] = []
+        seen_subtopic: set[str] = set()
+        total_in = 0
+        total_out = 0
+        api_calls = 0
+        max_rounds = max(32, (min_subtopics // STUDY_NOTES_CHUNK_SIZE) + 8)
+
+        while len(accumulated) < min_subtopics and api_calls < max_rounds:
+            need = min(STUDY_NOTES_CHUNK_SIZE, min_subtopics - len(accumulated))
+            if need <= 0:
+                break
+            covered = [n["subtopic"] for n in accumulated]
+            prompt = self._build_prompt(
+                exam=exam,
+                year=year,
+                subject=subject,
+                topic=topic,
+                batch_count=need,
+                read_time_target_minutes=read_time_target_minutes,
+                covered_subtopics=covered,
             )
-        notes = self._parse_and_validate(raw, min_subtopics=min_subtopics)
-        total_cost = self._calculate_cost(resp.usage.input_tokens, resp.usage.output_tokens)
+            resp = self.client.messages.create(
+                model=self.model,
+                max_tokens=STUDY_NOTES_MAX_OUTPUT_TOKENS,
+                temperature=0.4,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            api_calls += 1
+            total_in += resp.usage.input_tokens
+            total_out += resp.usage.output_tokens
+            raw = resp.content[0].text
+            if getattr(resp, "stop_reason", None) == "max_tokens":
+                raise ValueError(
+                    "Claude hit the maximum output length on a batch. "
+                    "Retry; if it persists, reduce min_subtopics or we can lower STUDY_NOTES_CHUNK_SIZE."
+                )
+            batch = self._parse_and_validate(raw, min_required=need)
+            before = len(accumulated)
+            for item in batch:
+                key = str(item.get("subtopic", "")).casefold().strip()
+                if not key or key in seen_subtopic:
+                    continue
+                seen_subtopic.add(key)
+                accumulated.append(item)
+            if len(accumulated) == before:
+                raise ValueError(
+                    "No new subtopics were added in this batch (duplicates or empty). "
+                    "Try again or lower min_subtopics."
+                )
+
+        if len(accumulated) < min_subtopics:
+            raise ValueError(
+                f"After {api_calls} API call(s), only {len(accumulated)} distinct subtopics were generated; "
+                f"needed {min_subtopics}."
+            )
+
+        # Trim if the model over-delivered on the last batch.
+        if len(accumulated) > min_subtopics:
+            accumulated = accumulated[:min_subtopics]
+
+        for i, item in enumerate(accumulated, start=1):
+            item["sequence_number"] = i
+
+        total_cost = self._calculate_cost(total_in, total_out)
 
         note_set_res = self.supabase.table("study_note_sets").insert(
             {
@@ -235,8 +292,8 @@ Hard rules:
                 "generated_by": user_email or "api",
                 "source_url": source_url,
                 "read_time_target_minutes": read_time_target_minutes,
-                "total_subtopics": len(notes),
-                "total_tokens_used": resp.usage.input_tokens + resp.usage.output_tokens,
+                "total_subtopics": len(accumulated),
+                "total_tokens_used": total_in + total_out,
                 "total_cost": float(total_cost),
                 "status": "success",
             }
@@ -246,7 +303,7 @@ Hard rules:
         note_set_id = note_set_res.data[0]["id"]
 
         rows = []
-        for note in notes:
+        for note in accumulated:
             rows.append(
                 {
                     "note_set_id": note_set_id,
@@ -278,10 +335,10 @@ Hard rules:
                     "difficulty": "easy",
                     "topic": f"STUDY_NOTES::{topic}",
                     "count_requested": min_subtopics,
-                    "count_generated": len(notes),
+                    "count_generated": len(accumulated),
                     "count_failed": 0,
-                    "api_calls": 1,
-                    "total_tokens": resp.usage.input_tokens + resp.usage.output_tokens,
+                    "api_calls": api_calls,
+                    "total_tokens": total_in + total_out,
                     "total_cost": float(total_cost),
                     "status": "success",
                     "generated_by": user_email or "api",
@@ -296,10 +353,10 @@ Hard rules:
             year=year,
             subject=subject,
             topic=topic,
-            total_subtopics=len(notes),
+            total_subtopics=len(accumulated),
             notes=rows,
-            input_tokens=resp.usage.input_tokens,
-            output_tokens=resp.usage.output_tokens,
+            input_tokens=total_in,
+            output_tokens=total_out,
             total_cost=float(total_cost),
         )
 
