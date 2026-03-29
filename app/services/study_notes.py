@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
@@ -12,6 +13,9 @@ from app.db import get_supabase_client
 
 INPUT_TOKEN_PRICE_PER_1K = Decimal("0.003")
 OUTPUT_TOKEN_PRICE_PER_1K = Decimal("0.015")
+
+# Many Claude models cap completion at 8192; 6000 was too low for 20+ long cards → truncated JSON, no DB save.
+STUDY_NOTES_MAX_OUTPUT_TOKENS = 8192
 
 
 @dataclass
@@ -94,7 +98,7 @@ Output must be JSON only and follow this exact schema:
     {{
       "subtopic": "string",
       "title": "string",
-      "summary_text": "250-450 words, readable in about {read_time_target_minutes} minutes",
+      "summary_text": "string",
       "key_points": ["5-8 concise bullet points"],
       "examiner_focus": "what examiners usually test in this area",
       "common_mistakes": ["3-5 mistakes learners make"],
@@ -107,17 +111,32 @@ Output must be JSON only and follow this exact schema:
 
 Hard rules:
 1) Return at least {min_subtopics} UNIQUE subtopics.
-2) Use official curriculum-style wording relevant to {exam.upper()}.
-3) Keep notes practical and exam-focused.
-4) No markdown, no commentary, only valid JSON.
+2) Each summary_text: **130-260 words** (strict). Longer prose will be cut off and break JSON — stay compact.
+3) Valid JSON only: escape double quotes inside strings as \\", use \\n for newlines inside strings, no raw line breaks inside quoted strings.
+4) Use official curriculum-style wording relevant to {exam.upper()}.
+5) Keep notes practical and exam-focused.
+6) No markdown fences inside the JSON; outer response may be raw JSON only.
 """.strip()
 
+    @staticmethod
+    def _extract_json_text(raw_text: str) -> str:
+        """Pull JSON from ```json ... ``` if present; otherwise use trimmed raw text."""
+        raw = raw_text.strip()
+        m = re.search(r"```(?:json)?\s*([\s\S]*?)```", raw)
+        if m:
+            return m.group(1).strip()
+        return raw
+
     def _parse_and_validate(self, raw_text: str, min_subtopics: int) -> List[Dict[str, Any]]:
-        text = raw_text.strip()
-        if text.startswith("```"):
-            text = text.strip("`")
-            text = text.replace("json", "", 1).strip()
-        payload = json.loads(text)
+        text = self._extract_json_text(raw_text)
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError as e:
+            raise ValueError(
+                "Model returned invalid or incomplete JSON (often output was truncated mid-string). "
+                "Retry once; if it persists, lower min_subtopics. "
+                f"Parse error: {e}"
+            ) from e
         notes = payload.get("notes", [])
         if not isinstance(notes, list):
             raise ValueError("Model returned invalid notes format")
@@ -130,7 +149,8 @@ Hard rules:
             subtopic = " ".join(str(note.get("subtopic", "")).split()).strip()
             title = " ".join(str(note.get("title", "")).split()).strip()
             summary_text = str(note.get("summary_text", "")).strip()
-            if not subtopic or not title or len(summary_text) < 250:
+            # Align with prompt (130-260 words); short floor avoids accepting truncated fragments.
+            if not subtopic or not title or len(summary_text) < 200:
                 continue
             key = subtopic.casefold()
             if key in seen:
@@ -192,11 +212,17 @@ Hard rules:
         )
         resp = self.client.messages.create(
             model=self.model,
-            max_tokens=6000,
+            max_tokens=STUDY_NOTES_MAX_OUTPUT_TOKENS,
             temperature=0.4,
             messages=[{"role": "user", "content": prompt}],
         )
-        notes = self._parse_and_validate(resp.content[0].text, min_subtopics=min_subtopics)
+        raw = resp.content[0].text
+        if getattr(resp, "stop_reason", None) == "max_tokens":
+            raise ValueError(
+                "Claude hit the maximum output length; the JSON was likely incomplete. "
+                "Retry once, or lower min_subtopics / ask for shorter cards per topic."
+            )
+        notes = self._parse_and_validate(raw, min_subtopics=min_subtopics)
         total_cost = self._calculate_cost(resp.usage.input_tokens, resp.usage.output_tokens)
 
         note_set_res = self.supabase.table("study_note_sets").insert(
