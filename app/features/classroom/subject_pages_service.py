@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional
 import anthropic
 
 from app.config import get_settings
-from app.features.classroom.image_urls import is_allowed_diagram_url, subject_supports_diagrams
+from app.features.classroom.image_urls import is_allowed_diagram_url, subject_visual_hints
 from app.features.classroom.repository import ClassroomTopicPagesRepository
 from app.features.topics.repository import TopicsRepository
 from app.services.study_notes import StudyNotesService
@@ -37,7 +37,13 @@ def _extract_json(raw: str) -> str:
     return raw
 
 
-def _parse_sections(raw_text: str, min_need: int = 2, max_images_total: int = 6) -> List[Dict[str, Any]]:
+def _parse_sections(
+    raw_text: str,
+    min_need: int = 2,
+    max_images_total: int = 8,
+    min_images_total: int = 1,
+    max_images_per_section: int = 2,
+) -> List[Dict[str, Any]]:
     text = _extract_json(raw_text)
     try:
         payload = json.loads(text)
@@ -60,7 +66,7 @@ def _parse_sections(raw_text: str, min_need: int = 2, max_images_total: int = 6)
         imgs: List[Dict[str, str]] = []
         if isinstance(imgs_raw, list) and image_budget > 0:
             for im in imgs_raw:
-                if len(imgs) >= 1:
+                if len(imgs) >= max_images_per_section:
                     break
                 if not isinstance(im, dict):
                     continue
@@ -68,7 +74,7 @@ def _parse_sections(raw_text: str, min_need: int = 2, max_images_total: int = 6)
                 cap = " ".join(str(im.get("caption", "")).split()).strip()
                 if not u or not is_allowed_diagram_url(u):
                     continue
-                imgs.append({"url": u, "caption": cap or "Diagram"})
+                imgs.append({"url": u, "caption": cap or "Illustration"})
                 image_budget -= 1
                 if image_budget <= 0:
                     break
@@ -77,6 +83,12 @@ def _parse_sections(raw_text: str, min_need: int = 2, max_images_total: int = 6)
         out.append(row)
     if len(out) < min_need:
         raise ValueError(f"Only {len(out)} sections, need at least {min_need}")
+    total_imgs = sum(len(s["images"]) for s in out if isinstance(s.get("images"), list))
+    if total_imgs < min_images_total:
+        raise ValueError(
+            f"This topic page must include at least {min_images_total} valid Wikimedia Commons image(s); "
+            f"model returned {total_imgs}. Regenerate or retry."
+        )
     return out
 
 
@@ -127,16 +139,7 @@ class ClassroomSubjectPagesService:
         }
 
     def _prompt(self, exam: str, year: int, subject: str, topic: str) -> str:
-        science = subject_supports_diagrams(subject)
-        diagram_rules = ""
-        if science:
-            diagram_rules = """
-- **Diagrams (Biology / Chemistry / Physics only):** In **at most two** sections where a picture clearly helps
-  (e.g. reproductive system, apparatus, circuit, structure), add an optional `"images"` array on that section object:
-  `"images": [ {{ "url": "https://upload.wikimedia.org/wikipedia/commons/.../File.png", "caption": "Short label" }} ]`
-  Use **only** direct HTTPS URLs under **upload.wikimedia.org** (Wikimedia Commons file URLs you are confident exist).
-  If you are not sure a URL is valid, **omit** `"images"` entirely. At most **one** image per section; max **three** images total for the whole page.
-"""
+        hints = subject_visual_hints(subject)
         return f"""
 You are helping Nigerian SS3 students preparing for {exam.upper()}.
 
@@ -164,7 +167,14 @@ Rules:
 - Provide **4 to 6** sections (introduction, key ideas, definitions, exam tips, short recap — adapt to the topic).
 - Total body text about **400–550 words** across all sections (one printed page feel).
 - Escape quotes inside strings; valid JSON only.
-{diagram_rules}
+
+- **Illustrations (required):** The page must include **at least one** valid educational image for this topic.
+  Add an `"images"` array on the **one or two** sections where a visual helps most (often after introducing an idea):
+  `"images": [ {{ "url": "https://upload.wikimedia.org/wikipedia/commons/thumb/.../File.png/800px-File.png", "caption": "Short label" }} ]`
+- Use **only** direct **https://upload.wikimedia.org/** file URLs you are **confident exist** on Wikimedia Commons (no other hosts, no search pages).
+- Subject ideas for **{subject}**: {hints}
+- If no hyper-specific file exists, pick a **closely related** syllabus illustration (e.g. generic cell for a cell topic; number line or plot for Mathematics).
+- **At most two** `"images"` entries per section; **at most eight** images in total across the whole page.
 """.strip()
 
     def generate_one_topic(

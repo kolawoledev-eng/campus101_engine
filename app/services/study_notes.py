@@ -10,6 +10,7 @@ import anthropic
 
 from app.config import get_settings
 from app.db import get_supabase_client
+from app.features.classroom.image_urls import is_allowed_diagram_url, subject_visual_hints
 
 INPUT_TOKEN_PRICE_PER_1K = Decimal("0.003")
 OUTPUT_TOKEN_PRICE_PER_1K = Decimal("0.015")
@@ -94,6 +95,7 @@ class StudyNotesService:
                 "\n\nSubtopics already covered in earlier batches — do NOT repeat or closely paraphrase:\n- "
                 + "\n- ".join(tail)
             )
+        vhints = subject_visual_hints(subject)
         return f"""
 You are an expert exam prep curriculum writer.
 
@@ -114,6 +116,7 @@ Output must be JSON only and follow this exact schema:
       "subtopic": "string",
       "title": "string",
       "summary_text": "string",
+      "images": [ {{ "url": "https://upload.wikimedia.org/...", "caption": "short label for students" }} ],
       "key_points": ["5-8 concise bullet points"],
       "examiner_focus": "what examiners usually test in this area",
       "common_mistakes": ["3-5 mistakes learners make"],
@@ -127,10 +130,12 @@ Output must be JSON only and follow this exact schema:
 Hard rules:
 1) The "notes" array must contain **at least {batch_count}** objects (distinct subtopics).
 2) Each summary_text: **120-200 words** (strict). Stay compact so the JSON completes in one response.
-3) Valid JSON only: escape double quotes inside strings as \\", use \\n for newlines inside strings, no raw line breaks inside quoted strings.
-4) Use official curriculum-style wording relevant to {exam.upper()}.
-5) Keep notes practical and exam-focused.
-6) No markdown fences inside the JSON; outer response may be raw JSON only.
+3) **Images (required):** Every note must include **at least one** object in `"images"` with a direct **https://upload.wikimedia.org/** URL (Wikimedia Commons file only) and a short caption. Use **only** URLs you are confident exist. Ideas for **{subject}**: {vhints}
+   At most **two** images per note. Place the illustration where it supports the subtopic (students learn faster with visuals).
+4) Valid JSON only: escape double quotes inside strings as \\", use \\n for newlines inside strings, no raw line breaks inside quoted strings.
+5) Use official curriculum-style wording relevant to {exam.upper()}.
+6) Keep notes practical and exam-focused.
+7) No markdown fences inside the JSON; outer response may be raw JSON only.
 """.strip()
 
     @staticmethod
@@ -179,6 +184,22 @@ Hard rules:
             if not isinstance(common_mistakes, list):
                 common_mistakes = []
 
+            imgs_raw = note.get("images")
+            images: List[Dict[str, str]] = []
+            if isinstance(imgs_raw, list):
+                for im in imgs_raw:
+                    if len(images) >= 2:
+                        break
+                    if not isinstance(im, dict):
+                        continue
+                    u = str(im.get("url", "")).strip()
+                    cap = " ".join(str(im.get("caption", "")).split()).strip()
+                    if not u or not is_allowed_diagram_url(u):
+                        continue
+                    images.append({"url": u, "caption": cap or "Illustration"})
+            if len(images) < 1:
+                continue
+
             words = len(summary_text.split())
             read_time = round(words / 180, 2)
 
@@ -188,6 +209,7 @@ Hard rules:
                     "subtopic": subtopic,
                     "title": title,
                     "summary_text": summary_text,
+                    "images": images,
                     "key_points": key_points,
                     "examiner_focus": str(note.get("examiner_focus", "")).strip(),
                     "common_mistakes": common_mistakes,
@@ -322,6 +344,7 @@ Hard rules:
                     "quick_recap": note["quick_recap"],
                     "read_time_minutes": note["read_time_minutes"],
                     "syllabus_alignment": note["syllabus_alignment"],
+                    "images": note.get("images") or [],
                 }
             )
         self.supabase.table("study_notes").insert(rows).execute()
