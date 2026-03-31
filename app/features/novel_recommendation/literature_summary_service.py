@@ -34,6 +34,17 @@ def _extract_json(raw: str) -> str:
     return raw
 
 
+def _paragraph_count(body: str) -> int:
+    """Prefer blank-line breaks; fall back to single newlines if the model omits \\n\\n."""
+    t = body.strip()
+    chunks = re.split(r"\n\s*\n+", t)
+    n = sum(1 for c in chunks if len(c.strip()) >= 40)
+    if n >= 3:
+        return n
+    lines = [ln for ln in t.split("\n") if len(ln.strip()) >= 45]
+    return max(n, len(lines))
+
+
 def _parse_sections(raw_text: str, min_need: int) -> List[Dict[str, str]]:
     """Parse chapter-style objects: heading = short chapter title; body = narrative paragraphs."""
     text = _extract_json(raw_text)
@@ -50,8 +61,9 @@ def _parse_sections(raw_text: str, min_need: int) -> List[Dict[str, str]]:
             continue
         h = " ".join(str(item.get("heading", "")).split()).strip()
         b = str(item.get("body", "")).strip()
-        # Shorter floor for poems / short texts; chapters are still substantive revision chunks.
-        if not h or len(b) < 60:
+        # Target 4–5 paragraphs per chapter; allow 3 for a naturally short beat (e.g. tight poem block).
+        pc = _paragraph_count(b)
+        if not h or len(b) < 320 or pc < 3:
             continue
         out.append({"heading": h, "body": b})
     if len(out) < min_need:
@@ -91,7 +103,8 @@ Return **JSON only** (no markdown fences) with this shape:
 
 Rules:
 - Escape double quotes inside strings as \\".
-- Each body should read like a textbook narrative summary (roughly ½–1 exam page per chapter).
+- Each **body** must be **4–5 full paragraphs** for most chapters (aim for five where the plot beat is rich); use **3** only when the section is naturally short. Separate paragraphs with **two newlines** (`\\n\\n`) inside the JSON string. Do **not** use only one or two paragraphs per chapter.
+- Each body should read like a textbook narrative summary (about one exam page when read aloud).
 - JSON must be complete and valid.
 """.strip()
 
@@ -126,9 +139,9 @@ Rules:
 
 For each chapter:
 - **heading**: A short, evocative chapter title (2–6 words), e.g. "Dusk", "The Enticement". Do **not** write "Chapter 1" in the heading — only the title.
-- **body**: 2–4 paragraphs of **flowing narrative summary** in Nigerian SS3 / JAMB-friendly English (clear, classroom English; Naira, WAEC/JAMB, school life only where natural). Cover the work **in sequence** from the opening through roughly the **middle** of the plot (or first half of stanzas for a poem). Name key characters and events accurately; do not invent scenes.
+- **body**: **4–5 paragraphs** of **flowing narrative summary** (vary length: some chapters 4, some 5; use **3** paragraphs only for a naturally brief beat). Nigerian SS3 / JAMB-friendly English; Naira, WAEC/JAMB, school life only where natural. Cover the work **in sequence** from the opening through roughly the **middle** of the plot (or first half of stanzas for a poem). Name key characters and events accurately; do not invent scenes.
 
-For a **short poem or non-fiction extract**, treat each chapter as a **thematic block** in reading order (still 6 items), not a fake long plot.
+For a **short poem or non-fiction extract**, treat each chapter as a **thematic block** in reading order (still 6 items); still write **3–5 paragraphs** per block where possible.
 
 Do not include any copyright disclaimer in the JSON (the app shows it separately).""",
         )
@@ -143,7 +156,7 @@ Do not include any copyright disclaimer in the JSON (the app shows it separately
 
 Rules:
 - **heading**: Short chapter title only (never "Chapter 7" as the whole heading).
-- **body**: Continue the narrative from **after** where Part 1 stopped through the **ending**, resolution, and any epilogue. Weave in **themes, lessons, and exam-relevant points** inside the story-style paragraphs (no separate lecture-style section).
+- **body**: **4–5 paragraphs** each (mix of 4 and 5 across chapters; **3** only if the beat is short). Continue the narrative from **after** where Part 1 stopped through the **ending**, resolution, and any epilogue. Weave in **themes, lessons, and exam-relevant points** inside the story-style paragraphs (no separate lecture-style section). Separate paragraphs with `\\n\\n`.
 - Do **not** repeat Part 1 events or headings. No disclaimer text in JSON.
 
 Part 1 chapter titles (do not reuse): {", ".join(s["heading"] for s in sec1[:6])}""",

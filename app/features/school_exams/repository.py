@@ -22,23 +22,59 @@ class SchoolExamsRepository:
         out.sort(key=key)
         return out
 
+    @staticmethod
+    def _institution_sort_key(row: Dict[str, Any]) -> tuple[int, str]:
+        inst = row.get("institutions") or {}
+        rank = inst.get("display_rank")
+        try:
+            r = int(rank) if rank is not None else 500
+        except (TypeError, ValueError):
+            r = 500
+        return (r, (inst.get("name") or "").casefold())
+
     def list_institutions(self, exam_mode: str, year: int) -> List[Dict[str, Any]]:
         if exam_mode not in self.VALID_MODES:
             raise ValueError("exam_mode must be 'post-utme' or 'jupeb'")
         supabase = get_supabase_client()
         rows = (
             supabase.table("institution_exam_offerings")
-            .select("institution_id, institutions(name, short_code)")
+            .select(
+                "institution_id, institutions(name, short_code, city, state, "
+                "established_year, description, institution_type, display_rank)"
+            )
             .eq("exam_mode", exam_mode)
             .eq("year", year)
             .eq("active", True)
             .execute()
             .data
         )
-        return [
-            {"institution_name": row["institutions"]["name"], "short_code": row["institutions"].get("short_code")}
-            for row in rows
-        ]
+        rows = list(rows or [])
+        rows.sort(key=self._institution_sort_key)
+        out: List[Dict[str, Any]] = []
+        for row in rows:
+            inst = row.get("institutions") or {}
+            name = inst.get("name")
+            if not name:
+                continue
+            est = inst.get("established_year")
+            est_out: int | None = None
+            if est is not None:
+                try:
+                    est_out = int(est)
+                except (TypeError, ValueError):
+                    est_out = None
+            out.append(
+                {
+                    "institution_name": name,
+                    "short_code": inst.get("short_code"),
+                    "city": inst.get("city"),
+                    "state": inst.get("state"),
+                    "established_year": est_out,
+                    "description": inst.get("description"),
+                    "institution_type": inst.get("institution_type") or "public",
+                }
+            )
+        return out
 
     def _get_offering_id(self, exam_mode: str, institution_name: str, year: int) -> int:
         if exam_mode not in self.VALID_MODES:

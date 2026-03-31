@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import random
+import re
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -16,6 +18,83 @@ from app.schemas import BulkPastQuestionsRequest, EnsureBucketsRequest, PastQues
 router = APIRouter(prefix="/api/practice", tags=["practice"])
 
 _FIELDS = "id,question_text,option_a,option_b,option_c,option_d,correct_answer,explanation,topic,year,difficulty"
+
+_WS = re.compile(r"\s+")
+
+
+def _fingerprint_part(raw: Any) -> str:
+    s = str(raw or "").strip().lower()
+    s = _WS.sub(" ", s)
+    return s
+
+
+def _question_fingerprint(row: Dict[str, Any]) -> str:
+    """Stable hash so past vs generated duplicates (same stem/options) collapse to one card."""
+    blob = "|".join(
+        [
+            _fingerprint_part(row.get("question_text")),
+            _fingerprint_part(row.get("option_a")),
+            _fingerprint_part(row.get("option_b")),
+            _fingerprint_part(row.get("option_c")),
+            _fingerprint_part(row.get("option_d")),
+        ]
+    )
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _pack_row_fingerprint(row: Dict[str, Any]) -> str:
+    """Offline pack spans multiple years — keep same stem in different years as separate cards."""
+    blob = "|".join(
+        [
+            _fingerprint_part(row.get("question_text")),
+            _fingerprint_part(row.get("option_a")),
+            _fingerprint_part(row.get("option_b")),
+            _fingerprint_part(row.get("option_c")),
+            _fingerprint_part(row.get("option_d")),
+            str(row.get("year", "")),
+            _fingerprint_part(row.get("difficulty")),
+            _fingerprint_part(row.get("topic")),
+        ]
+    )
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _finalize_unique_past_then_generated(
+    past: List[Dict[str, Any]],
+    gen: List[Dict[str, Any]],
+    limit: int,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    Past-first: unique past up to [limit], then unique generated for the remainder.
+    Drops duplicates within each list and across lists (generated that match a kept past row).
+    """
+    seen: Set[str] = set()
+    out_past: List[Dict[str, Any]] = []
+    for r in past:
+        if len(out_past) >= limit:
+            break
+        fp = _question_fingerprint(r)
+        if fp in seen:
+            continue
+        seen.add(fp)
+        row = dict(r)
+        row["source"] = "past"
+        out_past.append(row)
+
+    need = limit - len(out_past)
+    out_gen: List[Dict[str, Any]] = []
+    for r in gen:
+        if len(out_gen) >= need:
+            break
+        fp = _question_fingerprint(r)
+        if fp in seen:
+            continue
+        seen.add(fp)
+        row = dict(r)
+        row["source"] = "generated"
+        out_gen.append(row)
+    return out_past, out_gen
+
 
 # Default off to avoid mobile timeouts and surprise Claude cost. Set DOWNLOAD_PACK_BACKFILL_DEFAULT=true on the host to opt in.
 _download_bf_env = os.getenv("DOWNLOAD_PACK_BACKFILL_DEFAULT", "").strip().lower()
@@ -76,7 +155,13 @@ def _collect_bucket(
     limit: int,
     topic: Optional[str] = None,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    past: List[Dict[str, Any]] = []
+    """
+    Prefer past_questions, then top up with generated_questions.
+    Fetches extra rows from DB when needed so duplicates (same stem/options) do not eat slots.
+    """
+    fetch_cap = min(500, max(limit * 10, limit + 50))
+
+    past_raw: List[Dict[str, Any]] = []
     try:
         q = (
             supabase.table("past_questions")
@@ -88,13 +173,25 @@ def _collect_bucket(
         )
         if topic and topic.lower() != "all topics":
             q = q.eq("topic", topic)
-        past = q.limit(limit).execute().data or []
+        past_raw = q.limit(fetch_cap).execute().data or []
     except Exception:
-        past = []
+        past_raw = []
+
+    seen: Set[str] = set()
+    past: List[Dict[str, Any]] = []
+    for r in past_raw:
+        if len(past) >= limit:
+            break
+        fp = _question_fingerprint(r)
+        if fp in seen:
+            continue
+        seen.add(fp)
+        past.append(dict(r))
 
     need = limit - len(past)
     gen: List[Dict[str, Any]] = []
     if need > 0:
+        gen_raw: List[Dict[str, Any]] = []
         try:
             q2 = (
                 supabase.table("generated_questions")
@@ -106,9 +203,18 @@ def _collect_bucket(
             )
             if topic and topic.lower() != "all topics":
                 q2 = q2.eq("topic", topic)
-            gen = q2.limit(need).execute().data or []
+            gen_raw = q2.limit(fetch_cap).execute().data or []
         except Exception:
-            gen = []
+            gen_raw = []
+
+        for r in gen_raw:
+            if len(gen) >= need:
+                break
+            fp = _question_fingerprint(r)
+            if fp in seen:
+                continue
+            seen.add(fp)
+            gen.append(dict(r))
 
     for p in past:
         p["source"] = "past"
@@ -137,24 +243,22 @@ def _merge_jamb_use_of_english_bucket(
         return past, gen
     need = limit - total
     past2, gen2 = _collect_bucket(supabase, exam, year, "English", difficulty, need, topic=topic)
-    seen = {str(x.get("id", "")) for x in past + gen if x.get("id")}
+    seen_fp = {_question_fingerprint(x) for x in past + gen}
     for row in past2:
         if len(past) + len(gen) >= limit:
             break
-        uid = str(row.get("id", ""))
-        if uid and uid in seen:
+        fp = _question_fingerprint(row)
+        if fp in seen_fp:
             continue
-        if uid:
-            seen.add(uid)
+        seen_fp.add(fp)
         past.append(row)
     for row in gen2:
         if len(past) + len(gen) >= limit:
             break
-        uid = str(row.get("id", ""))
-        if uid and uid in seen:
+        fp = _question_fingerprint(row)
+        if fp in seen_fp:
             continue
-        if uid:
-            seen.add(uid)
+        seen_fp.add(fp)
         gen.append(row)
     return past, gen
 
@@ -170,6 +274,7 @@ async def practice_session(
 ) -> Dict[str, Any]:
     """
     Build a practice set: prefer rows from past_questions, then generated_questions.
+    All returned questions are unique by stem+options fingerprint (past first, then generated).
     """
     try:
         supabase = get_supabase_client()
@@ -177,6 +282,7 @@ async def practice_session(
         past, gen = _merge_jamb_use_of_english_bucket(
             supabase, exu, year, subject, difficulty, limit, topic=topic
         )
+        past, gen = _finalize_unique_past_then_generated(past, gen, limit)
 
         combined = past + gen
         random.shuffle(combined)
@@ -263,11 +369,15 @@ async def download_pack(
                 past, gen = _merge_jamb_use_of_english_bucket(
                     supabase, ex, yr, subject, diff, limit_per_year_difficulty, topic=None
                 )
+                past, gen = _finalize_unique_past_then_generated(
+                    past, gen, limit_per_year_difficulty
+                )
                 for row in past + gen:
-                    uid = str(row.get("id", ""))
-                    if uid and uid not in seen:
-                        seen.add(uid)
-                        combined.append(row)
+                    fp = _pack_row_fingerprint(row)
+                    if fp in seen:
+                        continue
+                    seen.add(fp)
+                    combined.append(row)
 
         random.shuffle(combined)
         return {
