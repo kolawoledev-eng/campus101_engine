@@ -58,7 +58,16 @@ class PastQuestionRow(BaseModel):
     option_d: str
     correct_answer: str
     explanation: Optional[str] = None
+    image_url: Optional[str] = Field(
+        default=None,
+        description="Optional HTTPS URL for a diagram or figure referenced in the stem.",
+    )
     source_label: Optional[str] = None
+    learning_outcomes: List[str] = Field(default_factory=list)
+    syllabus_alignment: Optional[str] = None
+    source_type: str = Field(default="past")
+    tokens_used: Optional[int] = None
+    api_cost: Optional[float] = None
 
     @field_validator("correct_answer")
     @classmethod

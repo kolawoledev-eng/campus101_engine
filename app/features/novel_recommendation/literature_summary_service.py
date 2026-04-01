@@ -84,7 +84,7 @@ class LiteratureSummaryService:
 
     def _prompt_part(self, title: str, author: str, part_label: str, instructions: str) -> str:
         return f"""
-You are helping Nigerian SS3 students preparing for JAMB Literature in English.
+You are helping Nigerian SS3 students preparing for Recommended Novels in English.
 
 Work: **{title}** by **{author}**.
 
@@ -158,7 +158,7 @@ Do not include disclaimer text in JSON.""",
         if len(clipped) > 14000:
             clipped = clipped[:14000] + "\n\n[Truncated for prompt size]"
         prompt = f"""
-You are helping Nigerian SS3 students preparing for JAMB Literature in English.
+You are helping Nigerian SS3 students preparing for Recommended Novels in English.
 
 Work: **{work_title}** by **{author}**.
 Current chapter: {chapter_number} — "{chapter_title}".

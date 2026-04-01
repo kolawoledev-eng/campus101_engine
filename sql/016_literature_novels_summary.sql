@@ -1,4 +1,4 @@
--- JAMB Literature in English: canonical novel/poetry/drama list + cached Claude summaries (generate-once).
+-- Recommended Novels in English: canonical novel/poetry/drama list + cached Claude summaries (generate-once).
 
 create table if not exists literature_novels (
   id bigserial primary key,

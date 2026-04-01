@@ -13,7 +13,8 @@ Run before store submission or a major production deploy.
 
 ## Supabase (production)
 
-- [ ] Apply SQL migrations in order: `001_schema.sql` → `007_subject_display_rank.sql`
+- [ ] Apply SQL migrations in order through the latest in `engine/sql/` (includes `023_past_questions_metadata.sql`, `024_question_images.sql` for past-question diagrams and `past_questions.image_url`).
+- [ ] Optional: ingest licensed past MCQs (e.g. `engine/scripts/import_blyr_past_questions.py`) after `024` is applied so `image_url` is stored for diagram questions.
 
 ## Secrets
 
@@ -23,6 +24,8 @@ Run before store submission or a major production deploy.
 ## Flutter production build
 
 - [ ] `flutter build … --dart-define=API_BASE=https://your-engine.example.com` (no trailing slash)
+- [ ] Optional support overrides: `--dart-define=SUPPORT_EMAIL=support@yourdomain.com` and `--dart-define=SUPPORT_WHATSAPP=234XXXXXXXXXXX` (digits only, country code, no `+`). Defaults live in `app/lib/config/beta_config.dart`.
+- [ ] Activation/payments: engine Flutterwave checkout env vars set (`FLUTTERWAVE_*` / secrets per `engine` auth service); test `POST /api/auth/activation/checkout` end-to-end before store submission.
 
 ## QA (manual)
 
@@ -37,6 +40,13 @@ Run before store submission or a major production deploy.
 | School sparse data | If first fetch is sparse, auto-generation/retry fills; only show failure on true quota/config outage |
 | AI tutor | In offline national practice, open **AI tutor** sheet; question sends to `POST /api/tutor/chat` (needs internet) |
 | Weak topics | Miss a question offline → Drawer **Weak topics practice** lists subject → session from saved topics |
+
+## Store submission (Apple / Google)
+
+- [ ] Privacy policy URL + support URL (often same as support email or a contact page)
+- [ ] Screenshots per required device sizes, feature graphic (Play), app description aligned with actual scope
+- [ ] Content rating / data safety questionnaires (account data, optional analytics)
+- [ ] Release signing: Android App Bundle / iOS archive + App Store Connect / Play Console tracks
 
 ## Store copy (honest scope)
 

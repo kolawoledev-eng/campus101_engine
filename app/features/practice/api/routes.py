@@ -19,7 +19,13 @@ from app.schemas import BulkPastQuestionsRequest, EnsureBucketsRequest, PastQues
 
 router = APIRouter(prefix="/api/practice", tags=["practice"])
 
-_FIELDS = "id,question_text,option_a,option_b,option_c,option_d,correct_answer,explanation,topic,year,difficulty"
+# Practice session: past + generated share MCQ columns; only past_questions has source_label.
+_MCQ_FIELDS = (
+    "id,question_text,option_a,option_b,option_c,option_d,correct_answer,explanation,image_url,topic,year,difficulty,"
+    "learning_outcomes,syllabus_alignment,source_type,tokens_used,api_cost"
+)
+_PAST_FIELDS = _MCQ_FIELDS + ",source_label"
+_GEN_FIELDS = _MCQ_FIELDS
 
 _WS = re.compile(r"\s+")
 
@@ -71,40 +77,74 @@ def _pack_row_fingerprint(row: Dict[str, Any]) -> str:
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
-def _finalize_unique_past_then_generated(
+def _practice_past_ratio() -> float:
+    try:
+        r = float(os.getenv("PRACTICE_PAST_RATIO", "0.7"))
+    except ValueError:
+        r = 0.7
+    return max(0.0, min(1.0, r))
+
+
+def _split_past_gen_targets(limit: int, past_ratio: float) -> Tuple[int, int]:
+    pr = max(0.0, min(1.0, float(past_ratio)))
+    past_t = min(limit, int(round(limit * pr)))
+    return past_t, limit - past_t
+
+
+def _finalize_past_generated_ratio(
     past: List[Dict[str, Any]],
     gen: List[Dict[str, Any]],
     limit: int,
+    past_ratio: float,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
-    Past-first: unique past up to [limit], then unique generated for the remainder.
-    Drops duplicates within each list and across lists (generated that match a kept past row).
+    Target ~past_ratio past / ~(1-past_ratio) generated (unique by stem+options),
+    then backfill from either pool if one side is short.
     """
+    if limit <= 0:
+        return [], []
+    pr = max(0.0, min(1.0, float(past_ratio)))
+    past_target = min(limit, int(round(limit * pr)))
+    gen_target = limit - past_target
     seen: Set[str] = set()
     out_past: List[Dict[str, Any]] = []
-    for r in past:
-        if len(out_past) >= limit:
-            break
-        fp = _question_fingerprint(r)
-        if fp in seen:
-            continue
-        seen.add(fp)
-        row = dict(r)
-        row["source"] = "past"
-        out_past.append(row)
-
-    need = limit - len(out_past)
     out_gen: List[Dict[str, Any]] = []
-    for r in gen:
-        if len(out_gen) >= need:
-            break
+
+    def try_add(r: Dict[str, Any], label: str) -> bool:
         fp = _question_fingerprint(r)
         if fp in seen:
-            continue
+            return False
         seen.add(fp)
         row = dict(r)
-        row["source"] = "generated"
-        out_gen.append(row)
+        row["source"] = "past" if label == "past" else "generated"
+        if label == "past":
+            out_past.append(row)
+        else:
+            out_gen.append(row)
+        return True
+
+    for r in past:
+        if len(out_past) >= past_target:
+            break
+        try_add(r, "past")
+
+    for r in gen:
+        if len(out_gen) >= gen_target:
+            break
+        try_add(r, "generated")
+
+    need = limit - len(out_past) - len(out_gen)
+    if need > 0:
+        for r in past:
+            if need <= 0:
+                break
+            if try_add(r, "past"):
+                need -= 1
+        for r in gen:
+            if need <= 0:
+                break
+            if try_add(r, "generated"):
+                need -= 1
     return out_past, out_gen
 
 
@@ -173,7 +213,7 @@ DOWNLOAD_PACK_BACKFILL_DEFAULT: bool = _download_bf_env in ("1", "true", "yes")
 
 
 def _past_row_to_db(r: PastQuestionRow) -> Dict[str, Any]:
-    return {
+    row: Dict[str, Any] = {
         "exam": r.exam.strip().upper(),
         "year": r.year,
         "subject": r.subject.strip(),
@@ -187,7 +227,15 @@ def _past_row_to_db(r: PastQuestionRow) -> Dict[str, Any]:
         "correct_answer": r.correct_answer,
         "explanation": (r.explanation or "").strip() or None,
         "source_label": (r.source_label or "").strip() or None,
+        "learning_outcomes": list(r.learning_outcomes or []),
+        "syllabus_alignment": (r.syllabus_alignment or "").strip() or None,
+        "source_type": (r.source_type or "past").strip() or "past",
     }
+    if r.tokens_used is not None:
+        row["tokens_used"] = r.tokens_used
+    if r.api_cost is not None:
+        row["api_cost"] = r.api_cost
+    return row
 
 
 @router.post("/admin/past-questions/bulk", dependencies=[Depends(verify_admin_key)])
@@ -223,39 +271,43 @@ def _collect_bucket(
     year: int,
     subject: str,
     difficulty: str,
-    limit: int,
+    past_limit: int,
+    gen_limit: int,
     topic: Optional[str] = None,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
-    Prefer past_questions, then top up with generated_questions.
-    Fetches extra rows from DB when needed so duplicates (same stem/options) do not eat slots.
+    Fetch up to past_limit unique past_questions and gen_limit unique generated_questions
+    (generated skips fingerprints already taken from past). Larger fetch_cap avoids
+    empty slots when many rows are duplicate stems.
     """
-    fetch_cap = min(500, max(limit * 10, limit + 50))
+    total = past_limit + gen_limit
+    fetch_cap = min(500, max(total * 10, total + 50, past_limit * 15, gen_limit * 15))
     aliases = _subject_aliases(exam, subject)
 
     past_raw: List[Dict[str, Any]] = []
-    try:
-        q = (
-            supabase.table("past_questions")
-            .select(_FIELDS + ",source_label")
-            .eq("exam", exam.upper())
-            .eq("year", year)
-            .eq("difficulty", difficulty)
-        )
-        if len(aliases) > 1:
-            q = q.in_("subject", aliases)
-        else:
-            q = q.eq("subject", subject)
-        if topic and topic.lower() != "all topics":
-            q = q.eq("topic", topic)
-        past_raw = q.limit(fetch_cap).execute().data or []
-    except Exception:
-        past_raw = []
+    if past_limit > 0:
+        try:
+            q = (
+                supabase.table("past_questions")
+                .select(_PAST_FIELDS)
+                .eq("exam", exam.upper())
+                .eq("year", year)
+                .eq("difficulty", difficulty)
+            )
+            if len(aliases) > 1:
+                q = q.in_("subject", aliases)
+            else:
+                q = q.eq("subject", subject)
+            if topic and topic.lower() != "all topics":
+                q = q.eq("topic", topic)
+            past_raw = q.limit(fetch_cap).execute().data or []
+        except Exception:
+            past_raw = []
 
     seen: Set[str] = set()
     past: List[Dict[str, Any]] = []
     for r in past_raw:
-        if len(past) >= limit:
+        if len(past) >= past_limit:
             break
         fp = _question_fingerprint(r)
         if fp in seen:
@@ -263,14 +315,13 @@ def _collect_bucket(
         seen.add(fp)
         past.append(dict(r))
 
-    need = limit - len(past)
     gen: List[Dict[str, Any]] = []
-    if need > 0:
+    if gen_limit > 0:
         gen_raw: List[Dict[str, Any]] = []
         try:
             q2 = (
                 supabase.table("generated_questions")
-                .select(_FIELDS)
+                .select(_GEN_FIELDS)
                 .eq("exam", exam.upper())
                 .eq("year", year)
                 .eq("difficulty", difficulty)
@@ -286,7 +337,7 @@ def _collect_bucket(
             gen_raw = []
 
         for r in gen_raw:
-            if len(gen) >= need:
+            if len(gen) >= gen_limit:
                 break
             fp = _question_fingerprint(r)
             if fp in seen:
@@ -307,26 +358,33 @@ def _merge_jamb_use_of_english_bucket(
     year: int,
     subject: str,
     difficulty: str,
-    limit: int,
+    past_limit: int,
+    gen_limit: int,
     topic: Optional[str] = None,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
     If packs were ingested as legacy JAMB subject name \"English\", merge them into Use of English.
     """
-    past, gen = _collect_bucket(supabase, exam, year, subject, difficulty, limit, topic=topic)
+    past, gen = _collect_bucket(
+        supabase, exam, year, subject, difficulty, past_limit, gen_limit, topic=topic
+    )
     if exam.upper() != "JAMB" or _subject_key(subject) not in {"useofenglish", "english"}:
         return past, gen
-    total = len(past) + len(gen)
-    if total >= limit:
+    need_past = past_limit - len(past)
+    need_gen = gen_limit - len(gen)
+    if need_past <= 0 and need_gen <= 0:
         return past, gen
-    need = limit - total
-    past2, gen2 = _collect_bucket(supabase, exam, year, "English", difficulty, need, topic=topic)
+    past2, gen2 = _collect_bucket(
+        supabase, exam, year, "English", difficulty, need_past, need_gen, topic=topic
+    )
     if not (past2 or gen2) and topic and topic.lower() != "all topics":
         # Legacy English rows often use old topic labels; relax topic to avoid empty sessions.
-        past2, gen2 = _collect_bucket(supabase, exam, year, "English", difficulty, need, topic=None)
+        past2, gen2 = _collect_bucket(
+            supabase, exam, year, "English", difficulty, need_past, need_gen, topic=None
+        )
     seen_fp = {_question_fingerprint(x) for x in past + gen}
     for row in past2:
-        if len(past) + len(gen) >= limit:
+        if len(past) >= past_limit:
             break
         fp = _question_fingerprint(row)
         if fp in seen_fp:
@@ -334,7 +392,7 @@ def _merge_jamb_use_of_english_bucket(
         seen_fp.add(fp)
         past.append(row)
     for row in gen2:
-        if len(past) + len(gen) >= limit:
+        if len(gen) >= gen_limit:
             break
         fp = _question_fingerprint(row)
         if fp in seen_fp:
@@ -355,8 +413,9 @@ async def practice_session(
     authorization: Optional[str] = Header(default=None),
 ) -> Dict[str, Any]:
     """
-    Build a practice set: prefer rows from past_questions, then generated_questions.
-    All returned questions are unique by stem+options fingerprint (past first, then generated).
+    Build a practice set: mix past_questions and generated_questions (~70/30 by default,
+    PRACTICE_PAST_RATIO). Questions are unique by stem+options fingerprint; if one pool is
+    short, the other fills remaining slots.
     """
     try:
         free_question_limit = 5
@@ -376,10 +435,12 @@ async def practice_session(
         effective_limit = limit if is_activated else min(limit, free_question_limit)
         supabase = get_supabase_client()
         exu = exam.upper()
+        ratio = _practice_past_ratio()
+        past_target, gen_target = _split_past_gen_targets(effective_limit, ratio)
         past, gen = _merge_jamb_use_of_english_bucket(
-            supabase, exu, year, subject, difficulty, effective_limit, topic=topic
+            supabase, exu, year, subject, difficulty, past_target, gen_target, topic=topic
         )
-        past, gen = _finalize_unique_past_then_generated(past, gen, effective_limit)
+        past, gen = _finalize_past_generated_ratio(past, gen, effective_limit, ratio)
 
         combined = past + gen
         auto_note: Optional[str] = None
@@ -502,16 +563,28 @@ async def download_pack(
             )
             backfill_report["enabled"] = True
 
+        pack_ratio = _practice_past_ratio()
+        past_pack_target, gen_pack_target = _split_past_gen_targets(
+            limit_per_year_difficulty, pack_ratio
+        )
+
         def collect_combined() -> List[Dict[str, Any]]:
             out: List[Dict[str, Any]] = []
             local_seen: Set[str] = set()
             for yr in year_list:
                 for diff in diffs:
                     past, gen = _merge_jamb_use_of_english_bucket(
-                        supabase, ex, yr, subject, diff, limit_per_year_difficulty, topic=None
+                        supabase,
+                        ex,
+                        yr,
+                        subject,
+                        diff,
+                        past_pack_target,
+                        gen_pack_target,
+                        topic=None,
                     )
-                    past, gen = _finalize_unique_past_then_generated(
-                        past, gen, limit_per_year_difficulty
+                    past, gen = _finalize_past_generated_ratio(
+                        past, gen, limit_per_year_difficulty, pack_ratio
                     )
                     for row in past + gen:
                         fp = _pack_row_fingerprint(row)
