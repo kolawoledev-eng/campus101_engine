@@ -67,9 +67,9 @@ create table if not exists activation_plans (
 
 insert into activation_plans (code, name, duration_days, price_kobo, is_active)
 values
-  ('month_1', '1 Month', 30, 200000, true),
-  ('month_3', '3 Months', 90, 300000, true),
-  ('year_1', '1 Year', 365, 500000, true)
+  ('month_1', '1 Month', 30, 150000, true),
+  ('month_3', '3 Months', 90, 250000, true),
+  ('year_1', '1 Year', 365, 400000, true)
 on conflict (code) do update set
   name = excluded.name,
   duration_days = excluded.duration_days,

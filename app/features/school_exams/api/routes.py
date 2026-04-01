@@ -104,11 +104,13 @@ async def get_questions(
             limit=limit,
         )
         note: str | None = None
+        generation_state: Dict[str, Any] = {"enabled": True, "ran": False, "errors": []}
         if not rows:
             # Auto top-up for empty buckets so users do not hit dead-ends.
             service = SchoolQuestionService()
             errors: list[str] = []
             topic_value = topic or "all topics"
+            generation_state["ran"] = True
             for diff, cnt in _difficulty_split(limit):
                 try:
                     service.generate_and_save(
@@ -123,6 +125,7 @@ async def get_questions(
                     )
                 except Exception as exc:
                     errors.append(f"{diff}: {exc}")
+            generation_state["errors"] = errors
             rows = repo.list_generated_questions(
                 exam_mode=exam_mode,
                 institution_name=institution_name,
@@ -143,9 +146,12 @@ async def get_questions(
             if errors:
                 note = f"partial generation notes: {'; '.join(errors)}"
         payload: Dict[str, Any] = {"status": "success", "count": len(rows), "questions": rows}
+        payload["generation_state"] = generation_state
         if note:
             payload["auto_generation_note"] = note
         return payload
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 

@@ -56,6 +56,8 @@ class AuthService:
         return {
             "is_activated": bool(active),
             "free_question_limit": 5,
+            "free_study_notes_limit": 2,
+            "free_novel_chapter_limit": 2,
             "activation_status": "active" if active else "inactive",
             "activation_ends_at": (active or {}).get("ends_at"),
         }

@@ -59,6 +59,8 @@ async def register(payload: RegisterRequest) -> Dict[str, Any]:
             "access": {
                 "is_activated": result["access"]["is_activated"],
                 "free_question_limit": result["access"]["free_question_limit"],
+                "free_study_notes_limit": result["access"]["free_study_notes_limit"],
+                "free_novel_chapter_limit": result["access"]["free_novel_chapter_limit"],
             },
         }
     except ValueError as exc:
@@ -79,6 +81,8 @@ async def login(payload: LoginRequest) -> Dict[str, Any]:
             "access": {
                 "is_activated": result["access"]["is_activated"],
                 "free_question_limit": result["access"]["free_question_limit"],
+                "free_study_notes_limit": result["access"]["free_study_notes_limit"],
+                "free_novel_chapter_limit": result["access"]["free_novel_chapter_limit"],
             },
         }
     except ValueError as exc:
@@ -122,6 +126,8 @@ async def access(authorization: Optional[str] = Header(default=None)) -> Dict[st
         "status": "success",
         "is_activated": payload["is_activated"],
         "free_question_limit": payload["free_question_limit"],
+        "free_study_notes_limit": payload["free_study_notes_limit"],
+        "free_novel_chapter_limit": payload["free_novel_chapter_limit"],
         "blocked_message": "Activate for unlimited access",
     }
 
