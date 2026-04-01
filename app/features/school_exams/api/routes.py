@@ -11,6 +11,16 @@ from app.features.school_exams.service import SchoolQuestionService
 router = APIRouter(prefix="/api/school-exams", tags=["school-exams"])
 
 
+def _difficulty_split(total: int) -> list[tuple[str, int]]:
+    base = total // 3
+    rem = total % 3
+    buckets = [("easy", base), ("medium", base), ("hard", base)]
+    for i in range(rem):
+        d, c = buckets[i]
+        buckets[i] = (d, c + 1)
+    return [(d, c) for d, c in buckets if c > 0]
+
+
 @router.get("/institutions")
 async def get_institutions(exam_mode: str = Query(...), year: int = Query(...)) -> Dict[str, Any]:
     try:
@@ -18,6 +28,8 @@ async def get_institutions(exam_mode: str = Query(...), year: int = Query(...)) 
         return {"status": "success", "count": len(rows), "institutions": rows}
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
@@ -82,7 +94,8 @@ async def get_questions(
     limit: int = Query(default=40, ge=1, le=200),
 ) -> Dict[str, Any]:
     try:
-        rows = SchoolExamsRepository().list_generated_questions(
+        repo = SchoolExamsRepository()
+        rows = repo.list_generated_questions(
             exam_mode=exam_mode,
             institution_name=institution_name,
             year=year,
@@ -90,7 +103,49 @@ async def get_questions(
             topic=topic,
             limit=limit,
         )
-        return {"status": "success", "count": len(rows), "questions": rows}
+        note: str | None = None
+        if not rows:
+            # Auto top-up for empty buckets so users do not hit dead-ends.
+            service = SchoolQuestionService()
+            errors: list[str] = []
+            topic_value = topic or "all topics"
+            for diff, cnt in _difficulty_split(limit):
+                try:
+                    service.generate_and_save(
+                        exam_mode=exam_mode,
+                        institution_name=institution_name,
+                        year=year,
+                        subject=subject,
+                        topic=topic_value,
+                        difficulty=diff,
+                        count=cnt,
+                        user_email="api-auto",
+                    )
+                except Exception as exc:
+                    errors.append(f"{diff}: {exc}")
+            rows = repo.list_generated_questions(
+                exam_mode=exam_mode,
+                institution_name=institution_name,
+                year=year,
+                subject=subject,
+                topic=topic,
+                limit=limit,
+            )
+            if not rows:
+                reason = "; ".join(errors) if errors else "unknown generation error"
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "No school questions available and auto-generation failed. "
+                        f"Likely Claude/API quota or config issue: {reason}"
+                    ),
+                )
+            if errors:
+                note = f"partial generation notes: {'; '.join(errors)}"
+        payload: Dict[str, Any] = {"status": "success", "count": len(rows), "questions": rows}
+        if note:
+            payload["auto_generation_note"] = note
+        return payload
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 

@@ -13,6 +13,7 @@ from app.core.db import get_supabase_client
 from app.features.practice.backfill import run_download_pack_backfill
 from app.features.practice.bucket_ensure import run_ensure_national_buckets
 from app.features.practice.past_ingest import insert_past_questions_batch
+from app.services.question_generator import QuestionGeneratorSupabase
 from app.schemas import BulkPastQuestionsRequest, EnsureBucketsRequest, PastQuestionRow
 
 router = APIRouter(prefix="/api/practice", tags=["practice"])
@@ -40,6 +41,16 @@ def _question_fingerprint(row: Dict[str, Any]) -> str:
         ]
     )
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _subject_key(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", (name or "").strip().lower())
+
+
+def _subject_aliases(exam: str, subject: str) -> List[str]:
+    if exam.upper() == "JAMB" and _subject_key(subject) in {"useofenglish", "english"}:
+        return ["Use of English", "English", "use of english", "english"]
+    return [subject]
 
 
 def _pack_row_fingerprint(row: Dict[str, Any]) -> str:
@@ -94,6 +105,65 @@ def _finalize_unique_past_then_generated(
         row["source"] = "generated"
         out_gen.append(row)
     return out_past, out_gen
+
+
+def _difficulty_split(total: int) -> List[Tuple[str, int]]:
+    base = total // 3
+    rem = total % 3
+    buckets = [("easy", base), ("medium", base), ("hard", base)]
+    for i in range(rem):
+        d, c = buckets[i]
+        buckets[i] = (d, c + 1)
+    return [(d, c) for d, c in buckets if c > 0]
+
+
+def _auto_generate_national_mix(
+    *,
+    exam: str,
+    year: int,
+    subject: str,
+    topic: Optional[str],
+    limit: int,
+) -> Tuple[List[Dict[str, Any]], str]:
+    try:
+        gen = QuestionGeneratorSupabase()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Auto-generation unavailable: {exc}",
+        ) from exc
+
+    generated: List[Dict[str, Any]] = []
+    errors: List[str] = []
+    topic_key = topic if topic and topic.lower() != "all topics" else "all topics"
+    for diff, cnt in _difficulty_split(limit):
+        try:
+            rows = gen.generate_and_save(
+                exam=exam.upper(),
+                year=year,
+                subject=subject,
+                difficulty=diff,
+                topic=topic_key,
+                count=cnt,
+                user_email="api-auto",
+            )
+            for r in rows:
+                row = dict(r)
+                row["source"] = "generated"
+                generated.append(row)
+        except Exception as exc:
+            errors.append(f"{diff}: {exc}")
+    if not generated:
+        reason = "; ".join(errors) if errors else "unknown generation error"
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "No questions available and auto-generation failed. "
+                f"Likely Claude/API quota or config issue: {reason}"
+            ),
+        )
+    random.shuffle(generated)
+    return generated[:limit], "; ".join(errors) if errors else ""
 
 
 # Default off to avoid mobile timeouts and surprise Claude cost. Set DOWNLOAD_PACK_BACKFILL_DEFAULT=true on the host to opt in.
@@ -160,6 +230,7 @@ def _collect_bucket(
     Fetches extra rows from DB when needed so duplicates (same stem/options) do not eat slots.
     """
     fetch_cap = min(500, max(limit * 10, limit + 50))
+    aliases = _subject_aliases(exam, subject)
 
     past_raw: List[Dict[str, Any]] = []
     try:
@@ -168,9 +239,12 @@ def _collect_bucket(
             .select(_FIELDS + ",source_label")
             .eq("exam", exam.upper())
             .eq("year", year)
-            .eq("subject", subject)
             .eq("difficulty", difficulty)
         )
+        if len(aliases) > 1:
+            q = q.in_("subject", aliases)
+        else:
+            q = q.eq("subject", subject)
         if topic and topic.lower() != "all topics":
             q = q.eq("topic", topic)
         past_raw = q.limit(fetch_cap).execute().data or []
@@ -198,9 +272,12 @@ def _collect_bucket(
                 .select(_FIELDS)
                 .eq("exam", exam.upper())
                 .eq("year", year)
-                .eq("subject", subject)
                 .eq("difficulty", difficulty)
             )
+            if len(aliases) > 1:
+                q2 = q2.in_("subject", aliases)
+            else:
+                q2 = q2.eq("subject", subject)
             if topic and topic.lower() != "all topics":
                 q2 = q2.eq("topic", topic)
             gen_raw = q2.limit(fetch_cap).execute().data or []
@@ -236,13 +313,16 @@ def _merge_jamb_use_of_english_bucket(
     If packs were ingested as legacy JAMB subject name \"English\", merge them into Use of English.
     """
     past, gen = _collect_bucket(supabase, exam, year, subject, difficulty, limit, topic=topic)
-    if exam.upper() != "JAMB" or subject != "Use of English":
+    if exam.upper() != "JAMB" or _subject_key(subject) not in {"useofenglish", "english"}:
         return past, gen
     total = len(past) + len(gen)
     if total >= limit:
         return past, gen
     need = limit - total
     past2, gen2 = _collect_bucket(supabase, exam, year, "English", difficulty, need, topic=topic)
+    if not (past2 or gen2) and topic and topic.lower() != "all topics":
+        # Legacy English rows often use old topic labels; relax topic to avoid empty sessions.
+        past2, gen2 = _collect_bucket(supabase, exam, year, "English", difficulty, need, topic=None)
     seen_fp = {_question_fingerprint(x) for x in past + gen}
     for row in past2:
         if len(past) + len(gen) >= limit:
@@ -285,14 +365,28 @@ async def practice_session(
         past, gen = _finalize_unique_past_then_generated(past, gen, limit)
 
         combined = past + gen
+        auto_note: Optional[str] = None
+        if not combined:
+            combined, auto_errors = _auto_generate_national_mix(
+                exam=exu,
+                year=year,
+                subject=subject,
+                topic=topic,
+                limit=limit,
+            )
+            if auto_errors:
+                auto_note = f"partial generation notes: {auto_errors}"
         random.shuffle(combined)
-        return {
+        payload: Dict[str, Any] = {
             "status": "success",
             "count": len(combined),
             "past_count": len(past),
             "generated_count": len(gen),
             "questions": combined[:limit],
         }
+        if auto_note is not None:
+            payload["auto_generation_note"] = auto_note
+        return payload
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
