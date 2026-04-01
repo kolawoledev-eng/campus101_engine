@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import re
 import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
@@ -22,26 +23,44 @@ _SYNTHETIC_EMAIL_SUFFIXES = (
 )
 
 
+def _flutterwave_synthetic_email_from_profile(user: Dict[str, Any]) -> str:
+    """Readable synthetic address when the user has no real inbox (still unique per account)."""
+    fn = f"{user.get('first_name') or ''}".strip().lower()
+    ln = f"{user.get('last_name') or ''}".strip().lower()
+    segments: list[str] = []
+    for chunk in (fn, ln):
+        c = re.sub(r"[^a-z0-9]+", "", chunk)
+        if c:
+            segments.append(c)
+    base = ".".join(segments) if segments else "learner"
+    base = base[:40].strip(".")
+    uid_compact = re.sub(r"[^a-z0-9]", "", str(user.get("id") or "").lower())[:12]
+    if uid_compact:
+        local = f"{base}.{uid_compact}" if base else uid_compact
+    else:
+        local = base or "user"
+    local = local.strip(".")[:64]
+    if not local:
+        local = "user"
+    return f"{local}@users.campus101.app"
+
+
 def _flutterwave_customer_email(user: Dict[str, Any]) -> str:
     """Return an address Flutterwave accepts for `customer.email`.
 
     **Subscription / activation is always tied to `user_id` and `tx_ref`** (see `meta` and
-    `create_pending_activation`), not to this email. Email is only for the payment gateway.
+    `create_pending_activation`), not to this email.
 
-    We do **not** use one shared address for every user (that breaks reconciliation and some
-    provider rules). If the user has no real email, we use **one default domain** with a
-    **unique local part per user**: ``{user_id}@users.campus101.app``.
+    - If the user saved a **real email**, use it.
+    - Otherwise use **first + last name** (sanitized) plus a short **user id** suffix on
+      ``@users.campus101.app`` so the address is unique and human-readable on receipts.
     """
     raw = (user.get("email") or "").strip()
     if raw and "@" in raw:
         lower = raw.lower()
         if not any(lower.endswith(s) for s in _SYNTHETIC_EMAIL_SUFFIXES):
             return raw
-    uid = str(user.get("id") or "").strip()
-    if not uid:
-        return "anonymous@users.campus101.app"
-    safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in uid)[:128]
-    return f"{safe}@users.campus101.app"
+    return _flutterwave_synthetic_email_from_profile(user)
 
 
 class AuthService:
