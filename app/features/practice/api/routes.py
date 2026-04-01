@@ -320,6 +320,12 @@ async def download_pack(
         le=300,
         description="Stop generating after this many new questions total (across all buckets) in one request.",
     ),
+    minimum_required: int = Query(
+        default=40,
+        ge=1,
+        le=400,
+        description="Minimum questions expected by client for a first offline session.",
+    ),
 ) -> Dict[str, Any]:
     """
     Bulk-fetch questions for offline practice: easy, medium, hard × each year (past + generated).
@@ -380,12 +386,33 @@ async def download_pack(
                     combined.append(row)
 
         random.shuffle(combined)
+        count = len(combined)
+        ready_for_offline = count >= minimum_required
+        if count == 0:
+            reason = backfill_report.get("reason") or "no questions available"
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    f"No questions available for {ex} {subject}. "
+                    f"Backfill state: enabled={backfill_report.get('enabled')} "
+                    f"ran={backfill_report.get('ran')} reason={reason}. "
+                    "Configure ANTHROPIC_API_KEY and enable backfill, or ingest past questions."
+                ),
+            )
         return {
             "status": "success",
             "exam": ex,
             "subject": subject,
             "years": year_list,
-            "count": len(combined),
+            "count": count,
+            "minimum_required": minimum_required,
+            "ready_for_offline": ready_for_offline,
+            "message": (
+                "Offline pack ready."
+                if ready_for_offline
+                else f"Pack downloaded but only {count} questions found (< {minimum_required}). "
+                "Try again shortly while generation backfills."
+            ),
             "questions": combined,
             "backfill": backfill_report,
         }
