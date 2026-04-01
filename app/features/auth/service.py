@@ -8,6 +8,7 @@ import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 from urllib.error import HTTPError
+from urllib.parse import urlencode
 from urllib import request as urlrequest
 
 from app.core.config import get_settings
@@ -289,18 +290,12 @@ class AuthService:
         )
         return {"checkout_url": link, "tx_ref": tx_ref}
 
-    def verify_flutterwave_and_activate(self, *, tx_ref: str, transaction_id: int) -> Dict[str, Any]:
-        activation = self.repo.get_activation_by_reference(tx_ref)
-        if not activation:
-            raise ValueError("Unknown payment reference")
-        if activation.get("status") == "active":
-            return {"status": "already_active"}
-
+    def _flutterwave_verify_get(self, url: str) -> Dict[str, Any]:
         settings = get_settings()
         if not settings.flutterwave_secret_key:
             raise ValueError("Flutterwave is not configured on server")
         req = urlrequest.Request(
-            f"https://api.flutterwave.com/v3/transactions/{transaction_id}/verify",
+            url,
             headers={
                 "Authorization": f"Bearer {settings.flutterwave_secret_key}",
             },
@@ -308,13 +303,20 @@ class AuthService:
         )
         try:
             with urlrequest.urlopen(req, timeout=30) as res:
-                body = json.loads(res.read().decode("utf-8"))
+                return json.loads(res.read().decode("utf-8"))
+        except HTTPError as exc:
+            try:
+                err = json.loads(exc.read().decode("utf-8", errors="replace"))
+            except json.JSONDecodeError:
+                err = {}
+            msg = err.get("message") or exc.reason or "verify failed"
+            raise ValueError(f"Flutterwave verify failed: {msg}") from exc
         except Exception as exc:
             raise ValueError(f"Flutterwave verify failed: {exc}") from exc
 
-        if body.get("status") != "success":
-            raise ValueError("Flutterwave verification not successful")
-        data = body.get("data") or {}
+    def _activate_from_flutterwave_charge(
+        self, *, activation: Dict[str, Any], data: Dict[str, Any], tx_ref: str
+    ) -> Dict[str, Any]:
         if str(data.get("tx_ref") or "") != tx_ref:
             raise ValueError("Payment reference mismatch")
         if str(data.get("currency") or "").upper() != "NGN":
@@ -351,4 +353,83 @@ class AuthService:
             ends_at_iso=ends_at.isoformat(),
         )
         return {"status": "activated", "starts_at": starts_at.isoformat(), "ends_at": ends_at.isoformat()}
+
+    def verify_flutterwave_and_activate(self, *, tx_ref: str, transaction_id: int) -> Dict[str, Any]:
+        activation = self.repo.get_activation_by_reference(tx_ref)
+        if not activation:
+            raise ValueError("Unknown payment reference")
+        if activation.get("status") == "active":
+            return {"status": "already_active"}
+
+        body = self._flutterwave_verify_get(
+            f"https://api.flutterwave.com/v3/transactions/{int(transaction_id)}/verify"
+        )
+        if body.get("status") != "success":
+            raise ValueError("Flutterwave verification not successful")
+        data = body.get("data") or {}
+        return self._activate_from_flutterwave_charge(
+            activation=activation, data=data, tx_ref=tx_ref
+        )
+
+    def try_confirm_activation_with_tx_ref(self, *, user_id: str, tx_ref: str) -> Dict[str, Any]:
+        """Poll Flutterwave by tx_ref and activate when payment is successful.
+
+        Used by the mobile app when webhooks are delayed or misconfigured. Only the
+        user who owns the pending row for ``tx_ref`` may confirm.
+        """
+        ref = (tx_ref or "").strip()
+        if not ref:
+            raise ValueError("Missing payment reference")
+        activation = self.repo.get_activation_by_reference(ref)
+        if not activation:
+            raise ValueError("Unknown payment reference")
+        if str(activation.get("user_id") or "") != str(user_id):
+            raise ValueError("Unknown payment reference")
+        if activation.get("status") == "active":
+            return {
+                "confirmed": True,
+                "already_active": True,
+                "activation": self.activation_status(user_id),
+            }
+
+        q = urlencode({"tx_ref": ref})
+        try:
+            body = self._flutterwave_verify_get(
+                f"https://api.flutterwave.com/v3/transactions/verify_by_reference?{q}"
+            )
+        except ValueError as exc:
+            err = str(exc).lower()
+            if "not found" in err or "no transaction" in err or "does not exist" in err:
+                return {
+                    "confirmed": False,
+                    "pending": True,
+                    "activation": self.activation_status(user_id),
+                }
+            raise
+
+        if body.get("status") != "success":
+            return {
+                "confirmed": False,
+                "pending": True,
+                "activation": self.activation_status(user_id),
+            }
+        data = body.get("data") or {}
+        try:
+            self._activate_from_flutterwave_charge(
+                activation=activation, data=data, tx_ref=ref
+            )
+        except ValueError as exc:
+            # Charge exists but not settled as successful yet — keep polling
+            if "payment not successful" in str(exc).lower():
+                return {
+                    "confirmed": False,
+                    "pending": True,
+                    "activation": self.activation_status(user_id),
+                }
+            raise
+        return {
+            "confirmed": True,
+            "already_active": False,
+            "activation": self.activation_status(user_id),
+        }
 

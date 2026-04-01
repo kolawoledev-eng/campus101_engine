@@ -9,6 +9,7 @@ from fastapi import APIRouter, Header, HTTPException, Request
 from app.core.config import get_settings
 from app.features.auth.schemas import (
     ActivationCheckoutRequest,
+    ActivationConfirmRequest,
     DeleteAccountRequest,
     LoginRequest,
     RegisterRequest,
@@ -159,6 +160,32 @@ async def activation_checkout(
         raise HTTPException(status_code=401, detail="Invalid or expired session")
     try:
         result = svc.create_flutterwave_checkout(user=user, plan_code=payload.plan_code.strip())
+        return {"status": "success", **result}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.post("/activation/confirm")
+async def activation_confirm(
+    payload: ActivationConfirmRequest,
+    authorization: Optional[str] = Header(default=None),
+) -> Dict[str, Any]:
+    """Confirm payment by ``tx_ref`` (Flutterwave verify-by-reference).
+
+    Lets the app activate the account when webhooks are delayed or unavailable.
+    """
+    token = _read_bearer(authorization)
+    svc = AuthService()
+    user = svc.user_from_token(token)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid or expired session")
+    try:
+        result = svc.try_confirm_activation_with_tx_ref(
+            user_id=user["id"],
+            tx_ref=payload.tx_ref,
+        )
         return {"status": "success", **result}
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
