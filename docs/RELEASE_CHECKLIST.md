@@ -2,9 +2,9 @@
 
 Run before store submission or a major production deploy.
 
-**Step-by-step production setup:** see [DEPLOY_OPS.md](./DEPLOY_OPS.md) (Supabase migration order, Render env, secret audit, Flutter `API_BASE`).
+**Step-by-step production setup:** see [DEPLOY_OPS.md](./DEPLOY_OPS.md) (Supabase migration order, host environment, secret audit, Flutter `API_BASE`).
 
-## Environment (engine host, e.g. Render)
+## Environment (engine host)
 
 - [ ] `SUPABASE_URL`, `SUPABASE_SERVICE_KEY` (or anon), `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL`
 - [ ] `CORS_ALLOWED_ORIGINS` set if you ship **Flutter web**; leave empty for mobile-only (`*` + no credentials)

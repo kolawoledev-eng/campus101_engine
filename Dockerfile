@@ -9,9 +9,9 @@
 #     -e SUPABASE_SERVICE_KEY=... \
 #     grade99-api
 #
-# Hosted deploy: point Render / Railway / Fly.io / Cloud Run at this Dockerfile
+# Hosted deploy: point your host (Railway / Fly.io / Cloud Run / etc.) at this Dockerfile
 # and set the same env vars in the dashboard. Use the HTTPS URL in Flutter:
-#   flutter run --dart-define=API_BASE=https://your-service.onrender.com
+#   flutter run --dart-define=API_BASE=https://your-service.example.com
 
 FROM python:3.12-slim
 

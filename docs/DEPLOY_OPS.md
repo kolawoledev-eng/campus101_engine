@@ -1,6 +1,6 @@
 # Production deploy operations (Phase A)
 
-Run these steps on your **production** Supabase project and **host** (e.g. Render) before a controlled go-live. No code deploy is required for this section beyond what is already merged.
+Run these steps on your **production** Supabase project and **host environment** before a controlled go-live. No code deploy is required for this section beyond what is already merged.
 
 ## 1. Secret audit (local / CI)
 
@@ -33,7 +33,7 @@ In the Supabase dashboard → **SQL Editor**, run each file **in order** (same o
 
 If a migration was partially applied before, resolve conflicts manually; do not skip earlier files.
 
-## 3. Render (or other host) environment
+## 3. Host environment
 
 Set these **environment variables** on the service that runs the FastAPI app:
 
